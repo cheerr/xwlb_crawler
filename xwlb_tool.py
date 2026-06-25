@@ -1048,10 +1048,9 @@ def generate_manuscripts(segments: list[dict], articles: list[dict],
         md_lines.append(f"")
 
         # 写入单条口播稿件
-        manu_filename = f"{idx:02d}_{safe_filename(title)}.txt"
+        manu_filename = f"{idx:02d}_[视频]{safe_filename(title)}.txt"
         manu_path = os.path.join(manuscripts_dir, manu_filename)
-        # 如果ASR已保存过（路径匹配），跳过重复写入
-        # 使用标准覆盖写入，确保每个标题只有一个文件
+        # 统一命名：带[视频]前缀，覆盖写入
         with open(manu_path, "w", encoding="utf-8") as f:
             f.write(f"# {title}\n")
             if article and article.get("source") == "asr":
@@ -1350,7 +1349,7 @@ async def main_async(args):
                 if idx:
                     safe_t = safe_filename(seg_title)
                     manu_path = os.path.join(output_dir, "manuscripts",
-                                             f"{idx:02d}_{safe_t}.txt")
+                                             f"{idx:02d}_[视频]{safe_t}.txt")
                     os.makedirs(os.path.dirname(manu_path), exist_ok=True)
                     with open(manu_path, "w", encoding="utf-8") as f:
                         f.write(f"# {seg_title}\n")
@@ -1385,22 +1384,24 @@ async def main_async(args):
         # 生成逐条口播稿件
         generate_manuscripts(segments, articles, output_dir, target_date, slice_results)
 
-        # 清理旧格式稿件（_asr后缀或[视频]前缀的重复文件）
+        # 清理重复稿件：保留带[视频]的，删除其他同名不同格式的
         manu_dir = os.path.join(output_dir, "manuscripts")
         if os.path.exists(manu_dir):
-            kept = set()
             for f in sorted(os.listdir(manu_dir)):
                 if not f.endswith(".txt"): continue
-                # 提取序号
-                prefix = f[:2] if f[:2].isdigit() else None
-                if prefix:
-                    # 保留最新修改的文件（ASR通常更大更新）
-                    if prefix not in kept:
-                        kept.add(prefix)
-                    else:
+                prefix = f[:2]
+                if not prefix.isdigit(): continue
+                # 检查是否有带[视频]的版本
+                video_ver = f"{prefix}_[视频]"
+                no_video_ver = f"{prefix}_"
+                # 如果当前文件是不带[视频]的版本，且存在同名带[视频]版本，删除当前
+                if "[视频]" not in f:
+                    # 查找对应的[视频]版本
+                    has_video = any(v.startswith(video_ver) for v in os.listdir(manu_dir))
+                    if has_video:
                         old_path = os.path.join(manu_dir, f)
                         os.remove(old_path)
-                        print(f"    🧹 清理重复: {f}")
+                        print(f"    🧹 清理无[视频]版本: {f}")
 
         log_lines.append(f"口播稿件: manuscripts/ 目录")
         # 生成README汇总（含文字稿+切片路径）
