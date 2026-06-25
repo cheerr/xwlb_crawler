@@ -1144,9 +1144,9 @@ def generate_readme(output_dir: str, target_date: datetime,
                 article = a
                 break
 
-        # 口播稿件文件路径
+        # 口播稿件文件路径（统一[视频]前缀命名）
         safe_t = safe_filename(title)
-        manu_rel = f"manuscripts/{idx:02d}_{safe_t}.txt"
+        manu_rel = f"manuscripts/{idx:02d}_[视频]{safe_t}.txt"
         if os.path.exists(os.path.join(output_dir, manu_rel)):
             lines.append(f"📝 **口播稿件**: [`{manu_rel}`]({manu_rel})")
 
@@ -1337,26 +1337,6 @@ async def main_async(args):
                 full_video_path, missing_segs, output_dir, target_date
             )
             for r in asr_results:
-                # 覆盖写入标准命名的manuscript文件
-                seg_title = r["title"]
-                idx = 0
-                for s in segments:
-                    if _titles_match(seg_title, s.get("title", "")):
-                        idx = s.get("index", idx) if "index" in s else idx
-                        if not idx:
-                            idx = segments.index(s) + 1
-                        break
-                if idx:
-                    safe_t = safe_filename(seg_title)
-                    manu_path = os.path.join(output_dir, "manuscripts",
-                                             f"{idx:02d}_[视频]{safe_t}.txt")
-                    os.makedirs(os.path.dirname(manu_path), exist_ok=True)
-                    with open(manu_path, "w", encoding="utf-8") as f:
-                        f.write(f"# {seg_title}\n")
-                        f.write(f"# 日期: {target_date.strftime('%Y-%m-%d')}\n")
-                        f.write(f"# 来源: 语音识别 (faster-whisper)\n\n")
-                        f.write(r["content"])
-                    r["_saved_path"] = manu_path
                 articles.append(r)
         elif missing_segs:
             print(f"\n  ⚠ {len(missing_segs)}条新闻无有效文字稿（ASR被跳过或视频未下载）")
@@ -1384,24 +1364,15 @@ async def main_async(args):
         # 生成逐条口播稿件
         generate_manuscripts(segments, articles, output_dir, target_date, slice_results)
 
-        # 清理重复稿件：保留带[视频]的，删除其他同名不同格式的
+        # 清理：只保留标准命名格式 {idx:02d}_[视频]{title}.txt
         manu_dir = os.path.join(output_dir, "manuscripts")
         if os.path.exists(manu_dir):
             for f in sorted(os.listdir(manu_dir)):
                 if not f.endswith(".txt"): continue
                 prefix = f[:2]
-                if not prefix.isdigit(): continue
-                # 检查是否有带[视频]的版本
-                video_ver = f"{prefix}_[视频]"
-                no_video_ver = f"{prefix}_"
-                # 如果当前文件是不带[视频]的版本，且存在同名带[视频]版本，删除当前
-                if "[视频]" not in f:
-                    # 查找对应的[视频]版本
-                    has_video = any(v.startswith(video_ver) for v in os.listdir(manu_dir))
-                    if has_video:
-                        old_path = os.path.join(manu_dir, f)
-                        os.remove(old_path)
-                        print(f"    🧹 清理无[视频]版本: {f}")
+                if prefix.isdigit() and "[视频]" not in f:
+                    os.remove(os.path.join(manu_dir, f))
+                    print(f"    🧹 清理非标准格式: {f}")
 
         log_lines.append(f"口播稿件: manuscripts/ 目录")
         # 生成README汇总（含文字稿+切片路径）
