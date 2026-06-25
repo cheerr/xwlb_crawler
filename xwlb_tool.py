@@ -14,7 +14,7 @@
   │   ├── 01_xxx.mp4
   │   └── ...
   └── manuscripts/        # 口播稿件（逐条纯文本）
-      ├── 01_xxx.txt
+      ├── 01_[视频]xxx.txt
       └── ...
 
 用法:
@@ -362,189 +362,83 @@ def download_full_video(video_info: dict, output_path: str, quality: int,
 # 步骤4: 获取文字稿
 # ============================================================================
 
-def fetch_text_articles(target_date: datetime, segments: list[dict] = None) -> list[dict]:
+def fetch_text_articles(target_date: datetime, segments: list[dict] = None,
+                        video_page_url: str = None) -> list[dict]:
     """
-    获取每条新闻的完整文字稿。
-
-    策略（按优先级）：
-      1. 通过移动搜索(search.cctv.com/m/)用关键词查找news.cctv.com文章
-      2. 从视频日期页获取简介作为兜底
-
-    返回: [{"title": "...", "content": "...", "url": "..."}, ...]
+    获取每条新闻的口播全文。
+    1. 优先用 segment 已有的 article_url（metadata.json 中）
+    2. 其次从日期页按顺序匹配分段链接
+    3. 提取页面 #content_area 完整文字稿
+    4. 内容<50字则跳过，交ASR兜底
     """
     ds = date_str(target_date)
     articles = []
-    seen_urls = set()
+    MIN_LEN = 50
 
-    # ==== 策略1: 移动搜索查找 news.cctv.com 完整文章 ====
-    print(f"  [策略1] 通过搜索查找完整文字稿（多关键词+自修复重试）...")
-    if segments:
-        for i, seg in enumerate(segments):
-            title = seg.get("title", "")
-            # 提取多组关键词（最多3组）
-            keyword_list = _extract_search_keywords(title)
-            if not keyword_list:
-                print(f"    [{i+1}/{len(segments)}] {title[:45]}... ✗ (无法提取关键词)")
-                continue
-
-            # 自修复：最多尝试3组关键词
-            found = False
-            for attempt, kw in enumerate(keyword_list):
-                article_url = _search_article(kw, ds, seen_urls)
-                if article_url:
-                    content = _fetch_article_content(article_url)
-                    if content and len(content) > 40:
-                        articles.append({
-                            "title": title,
-                            "url": article_url,
-                            "content": content,
-                        })
-                        seen_urls.add(article_url)
-                        print(f"    [{i+1}/{len(segments)}] {title[:45]}... "
-                              f"✓ ({len(content)}字, 关键词\"{kw[:20]}\", 尝试{attempt+1}次)")
-                        found = True
-                        time.sleep(0.5)
-                        break
-                    elif content:
-                        # 内容太短，记录但继续尝试下一个关键词
-                        print(f"    [{i+1}/{len(segments)}] {title[:45]}... "
-                              f"⚠ 关键词\"{kw[:20]}\"仅{len(content)}字, 尝试下一个")
-                        time.sleep(0.3)
-                time.sleep(0.2)
-
-            if not found:
-                print(f"    [{i+1}/{len(segments)}] {title[:45]}... "
-                      f"✗ ({len(keyword_list)}组关键词均未找到)")
-
-    # ==== 文本长度核验（标准：每分钟≥25字，不足1分钟按25字）====
-    valid_articles = []
-    short_articles = []
-    for a in articles:
-        # 查找对应segment的时长来确定最低字数要求
-        dur_sec = 60  # 默认1分钟
-        for seg in (segments or []):
-            if _titles_match(a["title"], seg.get("title", "")):
-                dur_sec = (seg.get("end", 0) - seg.get("start", 0)) / 1000.0
-                break
-        min_chars = max(25, int(dur_sec / 60 * 25))
-
-        if len(a["content"]) >= min_chars:
-            valid_articles.append(a)
-        else:
-            short_articles.append(a)
-            print(f"    ⚠ 核验不通过: {a['title'][:30]}... "
-                  f"仅{len(a['content'])}字 (需≥{min_chars}字, 时长{dur_sec:.0f}s)")
-
-    # 二次核验：检测是否仅为页面模板代码（非真实正文）
-    template_signatures = [
-        "正在加载", "责任编辑", "央视网首页", "返回新闻频道", "扫一扫 分享到微信",
-        "望海热线", "xinwenxiansuo", "京ICP备", "最新推荐", "加载更多",
-        "精彩图集", "全站地图", "点击收起全文", "A-A+"
-    ]
-    truly_valid = []
-    template_articles = []
-    for a in valid_articles:
-        score = sum(1 for sig in template_signatures if sig in a["content"])
-        if score >= 3:  # 含3个以上模板标记 → 是垃圾页面
-            template_articles.append(a)
-            print(f"    ⚠ 模板检测: {a['title'][:30]}... 含{score}个模板标记，判定为无效正文")
-        else:
-            truly_valid.append(a)
-
-    valid_articles = truly_valid
-    if template_articles:
-        short_articles.extend(template_articles)  # 也送去ASR
-
-    print(f"  ✓ 有效文字稿: {len(valid_articles)}条 (按每分钟≥25字标准)")
-    if short_articles:
-        print(f"  ⚠ 内容不足需ASR: {len(short_articles)}条")
-
-    return valid_articles
-
-
-def _extract_search_keywords(title: str) -> list[str]:
-    """
-    从新闻标题中提取多个搜索关键词策略（按优先级排列）。
-    返回最多3个搜索词列表，用于多策略尝试。
-    """
-    clean = re.sub(r'^\[视频\]|^完整版|【|】|\s+', '', title)
-    keywords = []
-
-    # 策略1: 人名 + 关键词
-    names = ["习近平", "李强", "赵乐际", "王沪宁", "蔡奇", "丁薛祥", "李希",
-             "韩正", "王毅", "秦刚", "何立峰", "张国清", "刘国中"]
-    for name in names:
-        if name in clean:
-            # 取人名后第一个有意义的词组（20字内）
-            idx = clean.index(name)
-            rest = clean[idx+len(name):idx+len(name)+20]
-            keywords.append(f"{name} {rest.strip('，。、的在了和与')}")
-            break
-
-    # 策略2: 国家/地区/机构名
-    entities = ["伊朗", "美国", "韩国", "日本", "俄罗斯", "欧盟", "北约",
-               "达沃斯", "链博会", "人大", "政协", "商务部", "央行", "证监会",
-               "全国统一大市场", "霍尔木兹", "欧佩克", "西芒杜", "一带一路",
-               "半导体", "新能源", "人工智能", "AI", "汽车", "外资", "外贸"]
-    found_entities = []
-    for ent in entities:
-        if ent in clean:
-            found_entities.append(ent)
-    if found_entities:
-        # 取前2个实体作为关键词
-        combo = " ".join(found_entities[:2])
-        if not any(combo in k for k in keywords):
-            keywords.append(combo)
-
-    # 策略3: 提取核心事件词（取前15个非停用词字符）
-    core = clean[:30]
-    # 去掉常见停用词
-    for sw in ["[视频]", "完整版", "我国", "举行", "会议", "出席"]:
-        core = core.replace(sw, "")
-    core = core.strip("，。、的在了和与是").strip()
-    if len(core) > 3 and core not in keywords:
-        keywords.append(core[:20])
-
-    # 策略4: 宽松关键词（只用前10个字符）
-    if len(clean) > 5:
-        simple = clean[:15].strip("，。、")
-        if simple not in keywords:
-            keywords.append(simple)
-
-    return keywords[:3]  # 最多3个
-
-
-def _search_article(keywords: str, date_str_yyyymmdd: str,
-                    exclude_urls: set[str]) -> str | None:
-    """在CCTV移动搜索中查找匹配日期的文章URL（含宽松日期匹配）"""
-    y, m, d = date_str_yyyymmdd[:4], date_str_yyyymmdd[4:6], date_str_yyyymmdd[6:8]
-    date_path = f"{y}/{m}/{d}"
-
+    # 1. 从日期页获取分段链接（备用）
+    day_url = DAY_PAGE_URL.format(date=ds)
+    seg_urls = []
     try:
-        query = requests.utils.quote(keywords)
-        url = (f"https://search.cctv.com/m/search.php?"
-               f"qtext={query}&type=web&pageSize=20")
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = requests.get(day_url, headers=HEADERS, timeout=30)
         resp.encoding = "utf-8"
-
-        # 策略A: 精确日期匹配
-        pattern = rf'https?://news\.cctv\.com/{date_path}/ARTI[a-zA-Z0-9]+\.shtml'
-        articles = list(set(re.findall(pattern, resp.text)))
-        for article_url in articles:
-            if article_url not in exclude_urls:
-                return article_url
-
-        # 策略B: 任意日期的news.cctv.com文章（日期宽松）
-        loose_pattern = r'https?://news\.cctv\.com/\d{4}/\d{2}/\d{2}/ARTI[a-zA-Z0-9]+\.shtml'
-        loose_articles = list(set(re.findall(loose_pattern, resp.text)))
-        for article_url in loose_articles:
-            if article_url not in exclude_urls:
-                return article_url
-
-    except Exception:
+        html = resp.text
+        seen = set()
+        for url in re.findall(
+            r'href="(https?://tv\.cctv\.com/\d{4}/\d{2}/\d{2}/VIDE[a-zA-Z0-9]+\.shtml)"',
+            html):
+            if url not in seen:
+                seen.add(url); seg_urls.append(url)
+    except requests.RequestException:
         pass
 
-    return None
+    print(f"  [文字稿] 提取 #content_area ({len(seg_urls)}个分段链接)...")
+
+    if not segments:
+        return articles
+
+    for i, seg in enumerate(segments):
+        title = seg.get("title", "")
+
+        # 策略1: 优先用已有 article_url
+        url = seg.get("article_url", "")
+
+        # 策略2: 日期页按顺序匹配
+        if not url:
+            seg_idx = i + 1  # 跳过第一个完整版链接
+            if seg_idx < len(seg_urls):
+                url = seg_urls[seg_idx]
+
+        if not url:
+            print(f"    [{i+1}/{len(segments)}] {title[:40]}... \u2717 (无URL)")
+            continue
+
+        # 提取 #content_area
+        content = ""
+        try:
+            r2 = requests.get(url, headers=HEADERS, timeout=15)
+            r2.encoding = "utf-8"
+            m = re.search(r'id="content_area"[^>]*>(.*?)</div>', r2.text, re.DOTALL)
+            if not m:
+                m = re.search(r'class="[^"]*cnt_bd[^"]*"[^>]*>(.*?)</div>', r2.text, re.DOTALL)
+            if m:
+                content = re.sub(r'<[^>]+>', ' ', m.group(1))
+                content = re.sub(r'&[a-z]+;', ' ', content)
+                content = re.sub(r'\s+', ' ', content).strip()
+                content = re.sub(r'^央视网消息\s*（新闻联播）[：:]\s*', '', content)
+        except requests.RequestException:
+            pass
+
+        if content and len(content) >= MIN_LEN:
+            articles.append({"title": title, "content": content, "url": url,
+                             "source": "content_area"})
+            print(f"    [{i+1}/{len(segments)}] {title[:40]}... \u2713 ({len(content)}字)")
+        else:
+            status = f"\u2717 ({len(content)}字)" if content else "\u2717"
+            print(f"    [{i+1}/{len(segments)}] {title[:40]}... {status}")
+        time.sleep(0.1)
+
+    print(f"  \u2713 口播全文: {len(articles)}/{len(segments)}条 (来源: #content_area, ≥{MIN_LEN}字)")
+    return articles
 
 
 def _clean_title(title: str) -> str:
@@ -742,35 +636,24 @@ def transcribe_segments(video_path: str, segments: list[dict],
 
     返回: [{"title": "...", "content": "...", "url": "", "source": "asr"}, ...]
     """
+    # 优先使用 Python faster-whisper 库
+    try:
+        from faster_whisper import WhisperModel
+        return _transcribe_with_faster_whisper(
+            video_path, segments, output_dir, target_date
+        )
+    except ImportError:
+        pass
+
+
+    # 最后尝试命令行
     import shutil
-
     asr_tool = shutil.which("whisper") or shutil.which("faster-whisper")
+    if asr_tool:
+        return _transcribe_with_cli_whisper(video_path, segments, output_dir, target_date)
 
-    if not asr_tool:
-        # 尝试用Python的faster-whisper库
-        try:
-            from faster_whisper import WhisperModel
-            return _transcribe_with_faster_whisper(
-                video_path, segments, output_dir, target_date
-            )
-        except ImportError:
-            pass
-
-        # 尝试用openai-whisper库
-        try:
-            import whisper
-            return _transcribe_with_openai_whisper(
-                video_path, segments, output_dir, target_date
-            )
-        except ImportError:
-            pass
-
-        print("  ⚠ 未安装whisper（pip install faster-whisper），跳过语音识别")
-        print("    安装方法: pip install faster-whisper")
-        return []
-
-    # 使用命令行whisper
-    return _transcribe_with_cli_whisper(video_path, segments, output_dir, target_date)
+    print("  ⚠ 未安装whisper（pip install faster-whisper），跳过语音识别")
+    return []
 
 
 def _transcribe_with_faster_whisper(video_path, segments, output_dir, target_date):
@@ -845,59 +728,6 @@ def _transcribe_with_faster_whisper(video_path, segments, output_dir, target_dat
 
     import shutil
     shutil.rmtree(tmpdir, ignore_errors=True)
-
-    print(f"    ASR完成: {len(results)}/{len(segments)} 段")
-    return results
-
-
-def _transcribe_with_openai_whisper(video_path, segments, output_dir, target_date):
-    """使用openai-whisper库进行语音识别"""
-    import whisper
-
-    print("    使用 openai-whisper 进行语音识别...")
-    model = whisper.load_model("small")
-
-    tmpdir = tempfile.mkdtemp(prefix="xwlb_asr_")
-    results = []
-
-    try:
-        for i, seg in enumerate(segments):
-            title = seg.get("title", f"segment_{i}")
-            start_s = seg.get("start", 0) / 1000.0
-            end_s = seg.get("end", 0) / 1000.0
-            dur_s = end_s - start_s
-
-            if dur_s <= 5:
-                continue
-
-            idx = i + 1
-            print(f"    [{idx}/{len(segments)}] ASR: {title[:40]}...", end=" ", flush=True)
-
-            audio_path = os.path.join(tmpdir, f"seg_{idx:02d}.wav")
-            extract_cmd = [
-                "ffmpeg", "-y", "-ss", str(start_s), "-i", video_path,
-                "-t", str(dur_s), "-vn", "-acodec", "pcm_s16le",
-                "-ar", "16000", "-ac", "1", audio_path,
-            ]
-            subprocess.run(extract_cmd, check=True, capture_output=True)
-
-            try:
-                result = model.transcribe(audio_path, language="zh")
-                full_text = result["text"].strip()
-                if full_text and len(full_text) > 10:
-                    results.append({
-                        "title": title, "content": full_text,
-                        "url": "", "source": "asr",
-                    })
-                    print(f"✓ ({len(full_text)}字)")
-                else:
-                    print("✗")
-            except Exception as e:
-                print(f"✗ ({e})")
-
-    finally:
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
     print(f"    ASR完成: {len(results)}/{len(segments)} 段")
     return results
@@ -1047,10 +877,16 @@ def generate_manuscripts(segments: list[dict], articles: list[dict],
         md_lines.append(f"---")
         md_lines.append(f"")
 
-        # 写入单条口播稿件
-        manu_filename = f"{idx:02d}_[视频]{safe_filename(title)}.txt"
+        # 写入单条口播稿件（已有更长内容则保留，不覆盖）
+        safe_t = safe_filename(title).replace('[视频]','')
+        manu_filename = f"{idx:02d}_[视频]{safe_t}.txt"
         manu_path = os.path.join(manuscripts_dir, manu_filename)
-        # 统一命名：带[视频]前缀，覆盖写入
+        existing_len = 0
+        if os.path.exists(manu_path):
+            existing_len = os.path.getsize(manu_path)
+        new_content = content if content else "（未获取到对应文字稿，请参考视频内容或使用语音识别工具提取）\n"
+        if len(new_content) < existing_len:
+            continue  # 已有更完整内容，跳过
         with open(manu_path, "w", encoding="utf-8") as f:
             f.write(f"# {title}\n")
             if article and article.get("source") == "asr":
@@ -1060,10 +896,7 @@ def generate_manuscripts(segments: list[dict], articles: list[dict],
             else:
                 f.write(f"# 日期: {target_date.strftime('%Y-%m-%d')}\n")
                 f.write(f"# 时长: {duration:.0f}秒\n\n")
-            if content:
-                f.write(content)
-            else:
-                f.write("（未获取到对应文字稿，请参考视频内容或使用语音识别工具提取）\n")
+            f.write(new_content)
 
     md_content = "\n".join(md_lines)
     md_path = os.path.join(output_dir, "daily_manuscript.md")
@@ -1145,7 +978,7 @@ def generate_readme(output_dir: str, target_date: datetime,
                 break
 
         # 口播稿件文件路径（统一[视频]前缀命名）
-        safe_t = safe_filename(title)
+        safe_t = safe_filename(title).replace('[视频]','')
         manu_rel = f"manuscripts/{idx:02d}_[视频]{safe_t}.txt"
         if os.path.exists(os.path.join(output_dir, manu_rel)):
             lines.append(f"📝 **口播稿件**: [`{manu_rel}`]({manu_rel})")
@@ -1317,7 +1150,7 @@ async def main_async(args):
     if not args.no_text:
         print()
         print("▶ 阶段3: 获取文字稿")
-        articles = fetch_text_articles(target_date, segments)
+        articles = fetch_text_articles(target_date, segments, video_url)
         log_lines.append(f"文字稿: {len(articles)}条")
         if articles:
             total_chars = sum(len(a["content"]) for a in articles)
@@ -1330,7 +1163,7 @@ async def main_async(args):
             if _clean_title(s.get("title", "")) not in matched_titles
         ]
         # ASR默认开启（除非显式--no-asr）
-        if missing_segs and not args.no_video and os.path.exists(full_video_path) and not args.no_asr:
+        if missing_segs and os.path.exists(full_video_path) and not args.no_asr:
             print(f"\n  [ASR兜底] {len(missing_segs)}条新闻未达字数标准(每分钟≥25字)，启动语音识别...")
             print(f"    缺失列表: {[s.get('title','')[:40] for s in missing_segs]}")
             asr_results = transcribe_segments(
