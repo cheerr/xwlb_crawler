@@ -1,8 +1,4 @@
----
-name: cctv-xwlb
-description: 采集央视《新闻联播》视频：下载完整视频 → 新闻切片 → 文字稿提取 → 口播稿件输出
-argument-hint: [日期] [--output 输出目录]
----
+
 
 # 央视《新闻联播》采集工具
 
