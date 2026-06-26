@@ -30,7 +30,7 @@
   python -m playwright install chromium
   brew install ffmpeg
 
-作者：Claude Code
+作者：cheerr
 """
 
 import argparse
